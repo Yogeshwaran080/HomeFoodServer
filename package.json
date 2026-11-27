@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Backend API for ஸ்ரீ Foods - Homestyle Food Catering & Subscription",
   "main": "server.js",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "node server.js",
     "server": "node server.js",

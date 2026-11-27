@@ -1,9 +1,9 @@
 const nodemailer = require('nodemailer');
-const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
 
 function generateBillPdfBuffer(bill) {
+  const PDFDocument = require('pdfkit');
   return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ size: 'A5', margin: 36 });
