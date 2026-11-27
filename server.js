@@ -30,6 +30,7 @@ const DB_FILE = path.join(DATA_DIR, 'orders.json');
 const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
 const GARBAGE_FILE = path.join(DATA_DIR, 'garbage.json');
 const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
+const FACES_FILE = path.join(DATA_DIR, 'faces.json');
 const ENV_FILE = path.join(__dirname, '.env');
 
 function loadEnvConfig() {
@@ -218,10 +219,31 @@ function verifyToken(token) {
 function verifyDeviceSessionToken(req) {
   const token = req.headers['x-device-token'];
   const payload = verifyToken(token);
-  if (!payload || payload.type !== 'device-session' || !payload.credentialID) return null;
-  const devices = readJsonDB(DEVICES_FILE);
-  const found = devices.find((d) => d.credentialID === payload.credentialID && !d.revoked);
-  return found || null;
+  if (!payload) return null;
+  if (payload.type === 'device-session' && payload.credentialID) {
+    const devices = readJsonDB(DEVICES_FILE);
+    return devices.find((d) => d.credentialID === payload.credentialID && !d.revoked) || null;
+  }
+  if (payload.type === 'face-session' && payload.faceId) {
+    const faces = readJsonDB(FACES_FILE);
+    const found = faces.find((f) => f.faceId === payload.faceId && !f.revoked);
+    return found ? { ...found, deviceName: found.label || 'Face ID' } : null;
+  }
+  return null;
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || a.length === 0) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom > 0 ? dot / denom : 0;
 }
 
 function getWebAuthnContext(req) {
@@ -333,6 +355,7 @@ ensureDbFile(DB_FILE, 'orders.json');
 ensureDbFile(CUSTOMERS_FILE, 'customers.json');
 ensureDbFile(GARBAGE_FILE, 'garbage.json');
 ensureDbFile(DEVICES_FILE, 'devices.json');
+ensureDbFile(FACES_FILE, 'faces.json');
 
 function normalizePhone10(phone) {
   return String(phone || '').replace(/\D/g, '').slice(-10);
@@ -609,18 +632,20 @@ app.get('/api/check-ip', (req, res) => {
   });
 });
 
-// Check IP or registered Passkey device access for /manage
+// Check IP, registered Passkey, or registered Face ID access for /manage
 app.get('/api/manage/access', (req, res) => {
   const clientIp = getClientIp(req);
   const device = verifyDeviceSessionToken(req);
   const ipOk = isClientIpAllowed(req);
   const hasRegisteredDevices = readJsonDB(DEVICES_FILE).some((d) => !d.revoked);
+  const hasRegisteredFaces = readJsonDB(FACES_FILE).some((f) => !f.revoked);
   if (!ipOk && !device) {
     return res.status(403).json({
       allowed: false,
       clientIp,
       hasRegisteredDevices,
-      error: 'Access denied. This management route is restricted to authorized IP addresses or registered Passkey devices.'
+      hasRegisteredFaces,
+      error: 'Access denied. This management route is restricted to authorized IP addresses, Passkey devices, or registered Face ID.'
     });
   }
   res.json({
@@ -628,7 +653,8 @@ app.get('/api/manage/access', (req, res) => {
     clientIp,
     deviceVerified: Boolean(device),
     deviceName: device ? device.deviceName : null,
-    hasRegisteredDevices
+    hasRegisteredDevices,
+    hasRegisteredFaces
   });
 });
 
@@ -816,6 +842,122 @@ app.delete('/api/manage/devices/:deviceId', requireAllowedIp, requireManageCode,
   writeJsonDB(DEVICES_FILE, devices);
   serverLogger.write('WARN', 'DEVICE_REVOKED', { deviceId, deviceName: devices[idx].deviceName });
   res.json({ success: true, devices: devices.filter((d) => !d.revoked) });
+});
+
+// ==================== FACE RECOGNITION & EYE-TRACKING BIOMETRICS ====================
+
+// Enroll Admin Face Descriptor
+app.post('/api/manage/face/register', requireAllowedIp, requireManageCode, (req, res) => {
+  const { descriptor, label = 'Admin Face ID' } = req.body || {};
+  if (!Array.isArray(descriptor) || descriptor.length < 30) {
+    return res.status(400).json({ error: 'Valid 3D facial landmark descriptor is required.' });
+  }
+  const faces = readJsonDB(FACES_FILE);
+  const newFace = {
+    faceId: `FACE-${Date.now().toString().slice(-6)}`,
+    label: String(label || 'Admin Face ID').trim(),
+    descriptor: descriptor.map((v) => Number(v)),
+    registeredAt: new Date().toISOString(),
+    revoked: false
+  };
+  faces.unshift(newFace);
+  writeJsonDB(FACES_FILE, faces);
+
+  const deviceToken = signToken({
+    type: 'face-session',
+    faceId: newFace.faceId,
+    label: newFace.label,
+    exp: Date.now() + 30 * 24 * 60 * 60 * 1000
+  });
+
+  serverLogger.write('INFO', 'FACE_ENROLLED', { faceId: newFace.faceId, label: newFace.label });
+  res.status(201).json({
+    success: true,
+    face: { faceId: newFace.faceId, label: newFace.label, registeredAt: newFace.registeredAt },
+    faces: faces.filter((f) => !f.revoked).map(({ faceId, label: lbl, registeredAt }) => ({ faceId, label: lbl, registeredAt })),
+    deviceToken
+  });
+});
+
+// Verify Live Face + Eye-Tracking Liveness from ANY IP
+app.post('/api/manage/face/verify', (req, res) => {
+  const { descriptor, livenessPassed } = req.body || {};
+  if (!livenessPassed) {
+    return res.status(400).json({ error: 'Eye-tracking liveness check not completed.' });
+  }
+  if (!Array.isArray(descriptor) || descriptor.length < 30) {
+    return res.status(400).json({ error: 'Invalid facial descriptor.' });
+  }
+  const faces = readJsonDB(FACES_FILE).filter((f) => !f.revoked);
+  if (faces.length === 0) {
+    return res.status(404).json({ error: 'No enrolled Face ID found.' });
+  }
+
+  let bestMatch = null;
+  let bestScore = -1;
+  for (const f of faces) {
+    const score = cosineSimilarity(descriptor, f.descriptor);
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = f;
+    }
+  }
+
+  if (!bestMatch || bestScore < 0.94) {
+    serverLogger.write('WARN', 'FACE_VERIFY_FAILED', { bestScore: Number(bestScore.toFixed(4)), ip: getClientIp(req) });
+    return res.status(401).json({
+      verified: false,
+      similarity: Number((bestScore * 100).toFixed(1)),
+      error: `Face mismatch (${(bestScore * 100).toFixed(1)}% match). Access denied.`
+    });
+  }
+
+  const deviceToken = signToken({
+    type: 'face-session',
+    faceId: bestMatch.faceId,
+    label: bestMatch.label,
+    exp: Date.now() + 30 * 24 * 60 * 60 * 1000
+  });
+
+  serverLogger.write('INFO', 'FACE_VERIFY_SUCCESS', {
+    faceId: bestMatch.faceId,
+    label: bestMatch.label,
+    similarity: Number(bestScore.toFixed(4)),
+    ip: getClientIp(req)
+  });
+
+  res.json({
+    verified: true,
+    label: bestMatch.label,
+    similarity: Number((bestScore * 100).toFixed(1)),
+    deviceToken
+  });
+});
+
+// List Enrolled Faces
+app.get('/api/manage/face/list', requireAllowedIp, requireManageCode, (req, res) => {
+  const faces = readJsonDB(FACES_FILE)
+    .filter((f) => !f.revoked)
+    .map(({ faceId, label, registeredAt }) => ({ faceId, label, registeredAt }));
+  res.json({ faces });
+});
+
+// Revoke Enrolled Face
+app.delete('/api/manage/face/:faceId', requireAllowedIp, requireManageCode, (req, res) => {
+  const { faceId } = req.params;
+  const faces = readJsonDB(FACES_FILE);
+  const idx = faces.findIndex((f) => f.faceId === faceId);
+  if (idx === -1) {
+    return res.status(404).json({ error: 'Face ID not found.' });
+  }
+  faces[idx].revoked = true;
+  faces[idx].revokedAt = new Date().toISOString();
+  writeJsonDB(FACES_FILE, faces);
+  serverLogger.write('WARN', 'FACE_REVOKED', { faceId, label: faces[idx].label });
+  res.json({
+    success: true,
+    faces: faces.filter((f) => !f.revoked).map(({ faceId: id, label, registeredAt }) => ({ faceId: id, label, registeredAt }))
+  });
 });
 
 function enrichOrdersWithEstimate(orders) {

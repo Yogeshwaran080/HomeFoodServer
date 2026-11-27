@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/index.js": {
-      "includeFiles": "{orders.json,customers.json,garbage.json,devices.json,logo-leaf.png}"
+      "includeFiles": "{orders.json,customers.json,garbage.json,devices.json,faces.json,logo-leaf.png}"
     }
   },
   "rewrites": [
