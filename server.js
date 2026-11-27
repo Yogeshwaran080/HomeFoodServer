@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { serverLogger, clientLogger } = require('./logger');
 const { sendActivationEmail, sendOrderReceivedEmail, sendOrderReminderEmail } = require('./mailer');
@@ -9,8 +10,8 @@ const app = express();
 app.set('trust proxy', true);
 const PORT = process.env.PORT || 5000;
 const RESTAURANT_WHATSAPP = '917200451980';
-const IS_VERCEL = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
-const DATA_DIR = IS_VERCEL ? '/tmp/homefood-data' : __dirname;
+const IS_VERCEL = Boolean(process.env.VERCEL || process.env.VERCEL_ENV || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DATA_DIR = IS_VERCEL ? path.join(os.tmpdir(), 'homefood-data') : __dirname;
 if (IS_VERCEL && !fs.existsSync(DATA_DIR)) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -239,13 +240,17 @@ app.use((req, res, next) => {
 
 // Initialize persistent DB files if not exists (seed /tmp from repo JSON on Vercel)
 function ensureDbFile(targetPath, seedName) {
-  if (!fs.existsSync(targetPath)) {
-    const seedPath = path.join(__dirname, seedName);
-    if (IS_VERCEL && fs.existsSync(seedPath)) {
-      fs.copyFileSync(seedPath, targetPath);
-    } else {
-      fs.writeFileSync(targetPath, JSON.stringify([]));
+  try {
+    if (!fs.existsSync(targetPath)) {
+      const seedPath = path.join(__dirname, seedName);
+      if (IS_VERCEL && fs.existsSync(seedPath)) {
+        fs.copyFileSync(seedPath, targetPath);
+      } else {
+        fs.writeFileSync(targetPath, JSON.stringify([]));
+      }
     }
+  } catch (e) {
+    // Fallback cleanly if filesystem write is restricted
   }
 }
 ensureDbFile(DB_FILE, 'orders.json');
@@ -298,12 +303,20 @@ function dedupeAllLists() {
     return true;
   });
 
-  writeJsonDB(CUSTOMERS_FILE, customers);
-  writeJsonDB(DB_FILE, orders);
-  writeJsonDB(GARBAGE_FILE, garbage);
+  try {
+    writeJsonDB(CUSTOMERS_FILE, customers);
+    writeJsonDB(DB_FILE, orders);
+    writeJsonDB(GARBAGE_FILE, garbage);
+  } catch (e) {
+    // Ignore on read-only environments
+  }
 }
 
-dedupeAllLists();
+try {
+  dedupeAllLists();
+} catch (e) {
+  // Ignore startup dedupe errors
+}
 
 function readJsonDB(filePath) {
   try {
@@ -386,7 +399,14 @@ function findDuplicateInCustomers(customers, phone, email = '', excludeCustomerI
   return null;
 }
 
-// Health Check
+// Root & Health Check
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Sri Lakshmi HomeFood Backend API'
+  });
+});
+
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
