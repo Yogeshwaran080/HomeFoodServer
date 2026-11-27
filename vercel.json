@@ -1,23 +1,13 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "server.js",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": [
-          "orders.json",
-          "customers.json",
-          "garbage.json",
-          "logo-leaf.png"
-        ]
-      }
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "{orders.json,customers.json,garbage.json,logo-leaf.png}"
     }
-  ],
-  "routes": [
+  },
+  "rewrites": [
     {
-      "src": "/(.*)",
-      "dest": "server.js"
+      "source": "/(.*)",
+      "destination": "/api/index"
     }
   ]
 }
