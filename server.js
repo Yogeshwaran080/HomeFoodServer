@@ -1,8 +1,15 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse
+} = require('@simplewebauthn/server');
 const { serverLogger, clientLogger } = require('./logger');
 const { sendActivationEmail, sendOrderReceivedEmail, sendOrderReminderEmail } = require('./mailer');
 
@@ -22,6 +29,7 @@ if (IS_VERCEL && !fs.existsSync(DATA_DIR)) {
 const DB_FILE = path.join(DATA_DIR, 'orders.json');
 const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
 const GARBAGE_FILE = path.join(DATA_DIR, 'garbage.json');
+const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
 const ENV_FILE = path.join(__dirname, '.env');
 
 function loadEnvConfig() {
@@ -184,6 +192,59 @@ function getClientIp(req) {
   return rawIp.replace(/^::ffff:/i, '').trim();
 }
 
+function signToken(payloadObj) {
+  const secret = `${getManageSecretCode()}:slhf-webauthn-v1`;
+  const data = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(data).digest('base64url');
+  return `${data}.${sig}`;
+}
+
+function verifyToken(token) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return null;
+  const [data, sig] = token.split('.');
+  const secret = `${getManageSecretCode()}:slhf-webauthn-v1`;
+  const expectedSig = crypto.createHmac('sha256', secret).update(data).digest('base64url');
+  if (sig.length !== expectedSig.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    if (parsed.exp && Date.now() > parsed.exp) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function verifyDeviceSessionToken(req) {
+  const token = req.headers['x-device-token'];
+  const payload = verifyToken(token);
+  if (!payload || payload.type !== 'device-session' || !payload.credentialID) return null;
+  const devices = readJsonDB(DEVICES_FILE);
+  const found = devices.find((d) => d.credentialID === payload.credentialID && !d.revoked);
+  return found || null;
+}
+
+function getWebAuthnContext(req) {
+  const originHeader = req.headers.origin;
+  const forwardedHost = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
+  const hostNoPort = String(forwardedHost).split(',')[0].trim().split(':')[0];
+  let rpID = hostNoPort;
+  let origin = originHeader;
+  if (originHeader) {
+    try {
+      const u = new URL(originHeader);
+      rpID = u.hostname;
+      origin = u.origin;
+    } catch (e) {
+      // Fallback to host
+    }
+  } else {
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    origin = `${proto}://${String(forwardedHost).split(',')[0].trim()}`;
+  }
+  return { rpID, origin, rpName: 'Sri Lakshmi HomeFood' };
+}
+
 function isIpMatch(clientIp, pattern) {
   if (!clientIp || !pattern) return false;
   if (pattern === '*') return true;
@@ -195,23 +256,37 @@ function isIpMatch(clientIp, pattern) {
   return false;
 }
 
-function requireAllowedIp(req, res, next) {
+function isClientIpAllowed(req) {
   const clientIp = getClientIp(req);
   const allowedIps = getAllowedIps();
-  const matched = allowedIps.some((pattern) => isIpMatch(clientIp, pattern));
-  if (!matched) {
+  return allowedIps.some((pattern) => isIpMatch(clientIp, pattern));
+}
+
+function requireAllowedIp(req, res, next) {
+  const device = verifyDeviceSessionToken(req);
+  if (device) {
+    req.verifiedDevice = device;
+    return next();
+  }
+  const clientIp = getClientIp(req);
+  if (!isClientIpAllowed(req)) {
     serverLogger.write('WARN', 'MANAGE_ACCESS_DENIED', { clientIp, path: req.originalUrl });
     return res.status(403).json({
       allowed: false,
       clientIp,
-      error: 'Access denied. This management route is restricted to authorized IP addresses.'
+      hasRegisteredDevices: readJsonDB(DEVICES_FILE).some((d) => !d.revoked),
+      error: 'Access denied. This management route is restricted to authorized IP addresses or registered Passkey devices.'
     });
   }
   next();
 }
 
 function requireManageCode(req, res, next) {
+  const device = req.verifiedDevice || verifyDeviceSessionToken(req);
   const code = (req.body && req.body.code) || req.headers['x-manage-code'] || '';
+  if (device && !code) {
+    return next();
+  }
   if (String(code).trim() !== getManageSecretCode()) {
     serverLogger.write('WARN', 'MANAGE_INVALID_CODE', { clientIp: getClientIp(req), path: req.originalUrl });
     return res.status(401).json({ valid: false, error: 'Invalid secret code.' });
@@ -257,6 +332,7 @@ function ensureDbFile(targetPath, seedName) {
 ensureDbFile(DB_FILE, 'orders.json');
 ensureDbFile(CUSTOMERS_FILE, 'customers.json');
 ensureDbFile(GARBAGE_FILE, 'garbage.json');
+ensureDbFile(DEVICES_FILE, 'devices.json');
 
 function normalizePhone10(phone) {
   return String(phone || '').replace(/\D/g, '').slice(-10);
@@ -533,14 +609,213 @@ app.get('/api/check-ip', (req, res) => {
   });
 });
 
-// Check IP access for /manage
-app.get('/api/manage/access', requireAllowedIp, (req, res) => {
-  res.json({ allowed: true, clientIp: getClientIp(req) });
+// Check IP or registered Passkey device access for /manage
+app.get('/api/manage/access', (req, res) => {
+  const clientIp = getClientIp(req);
+  const device = verifyDeviceSessionToken(req);
+  const ipOk = isClientIpAllowed(req);
+  const hasRegisteredDevices = readJsonDB(DEVICES_FILE).some((d) => !d.revoked);
+  if (!ipOk && !device) {
+    return res.status(403).json({
+      allowed: false,
+      clientIp,
+      hasRegisteredDevices,
+      error: 'Access denied. This management route is restricted to authorized IP addresses or registered Passkey devices.'
+    });
+  }
+  res.json({
+    allowed: true,
+    clientIp,
+    deviceVerified: Boolean(device),
+    deviceName: device ? device.deviceName : null,
+    hasRegisteredDevices
+  });
 });
 
 // Verify secret code (0000)
 app.post('/api/manage/verify', requireAllowedIp, requireManageCode, (req, res) => {
   res.json({ valid: true });
+});
+
+// ==================== WEBAUTHN / PASSKEY DEVICE ROUTES ====================
+
+// 1. Generate Passkey Registration Options (requires unlocked admin)
+app.post('/api/manage/webauthn/register-options', requireAllowedIp, requireManageCode, async (req, res) => {
+  try {
+    const { rpID, rpName } = getWebAuthnContext(req);
+    const devices = readJsonDB(DEVICES_FILE).filter((d) => !d.revoked);
+    const options = await generateRegistrationOptions({
+      rpName,
+      rpID,
+      userName: 'admin@srilakshmihomefood',
+      userDisplayName: 'Sri Lakshmi Admin',
+      attestationType: 'none',
+      excludeCredentials: devices.map((d) => ({ id: d.credentialID, transports: d.transports })),
+      authenticatorSelection: {
+        residentKey: 'preferred',
+        userVerification: 'required'
+      }
+    });
+    const challengeToken = signToken({
+      type: 'webauthn-reg',
+      challenge: options.challenge,
+      exp: Date.now() + 5 * 60 * 1000
+    });
+    res.json({ options, challengeToken });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to generate registration options.' });
+  }
+});
+
+// 2. Verify Passkey Registration & Save Device Public Key
+app.post('/api/manage/webauthn/register-verify', requireAllowedIp, requireManageCode, async (req, res) => {
+  try {
+    const { attestationResponse, challengeToken, deviceName = 'Trusted Device' } = req.body || {};
+    const tokenPayload = verifyToken(challengeToken);
+    if (!tokenPayload || tokenPayload.type !== 'webauthn-reg') {
+      return res.status(400).json({ error: 'Registration challenge expired. Please try again.' });
+    }
+    const { rpID, origin } = getWebAuthnContext(req);
+    const verification = await verifyRegistrationResponse({
+      response: attestationResponse,
+      expectedChallenge: tokenPayload.challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      requireUserVerification: true
+    });
+    if (!verification.verified || !verification.registrationInfo) {
+      return res.status(400).json({ error: 'Passkey verification failed.' });
+    }
+
+    const { credential } = verification.registrationInfo;
+    const devices = readJsonDB(DEVICES_FILE);
+    const newDevice = {
+      deviceId: `DEV-${Date.now().toString().slice(-6)}`,
+      deviceName: String(deviceName || 'Trusted Device').trim(),
+      credentialID: credential.id,
+      publicKeyBase64Url: Buffer.from(credential.publicKey).toString('base64url'),
+      counter: credential.counter || 0,
+      transports: attestationResponse?.response?.transports || ['internal'],
+      registeredAt: new Date().toISOString(),
+      revoked: false
+    };
+    const filtered = devices.filter((d) => d.credentialID !== newDevice.credentialID);
+    filtered.unshift(newDevice);
+    writeJsonDB(DEVICES_FILE, filtered);
+
+    const deviceToken = signToken({
+      type: 'device-session',
+      credentialID: newDevice.credentialID,
+      deviceName: newDevice.deviceName,
+      exp: Date.now() + 30 * 24 * 60 * 60 * 1000
+    });
+
+    serverLogger.write('INFO', 'DEVICE_REGISTERED', { deviceId: newDevice.deviceId, deviceName: newDevice.deviceName });
+    res.json({ verified: true, device: newDevice, devices: filtered.filter((d) => !d.revoked), deviceToken });
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'Passkey registration failed.' });
+  }
+});
+
+// 3. Generate Passkey Login Options (callable from any IP when a registered device exists)
+app.post('/api/manage/webauthn/login-options', async (req, res) => {
+  try {
+    const { rpID } = getWebAuthnContext(req);
+    const devices = readJsonDB(DEVICES_FILE).filter((d) => !d.revoked);
+    if (devices.length === 0) {
+      return res.status(404).json({ error: 'No registered Passkey devices found.' });
+    }
+    const options = await generateAuthenticationOptions({
+      rpID,
+      allowCredentials: devices.map((d) => ({
+        id: d.credentialID,
+        transports: d.transports
+      })),
+      userVerification: 'required'
+    });
+    const challengeToken = signToken({
+      type: 'webauthn-auth',
+      challenge: options.challenge,
+      exp: Date.now() + 5 * 60 * 1000
+    });
+    res.json({ options, challengeToken });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to start Passkey login.' });
+  }
+});
+
+// 4. Verify Passkey Login Signature & Issue 30-Day Device Session Token
+app.post('/api/manage/webauthn/login-verify', async (req, res) => {
+  try {
+    const { assertionResponse, challengeToken } = req.body || {};
+    const tokenPayload = verifyToken(challengeToken);
+    if (!tokenPayload || tokenPayload.type !== 'webauthn-auth') {
+      return res.status(400).json({ error: 'Login challenge expired. Please try again.' });
+    }
+    const devices = readJsonDB(DEVICES_FILE);
+    const idx = devices.findIndex((d) => d.credentialID === assertionResponse?.id && !d.revoked);
+    if (idx === -1) {
+      return res.status(403).json({ error: 'This device is not registered or has been revoked.' });
+    }
+    const device = devices[idx];
+    const { rpID, origin } = getWebAuthnContext(req);
+    const verification = await verifyAuthenticationResponse({
+      response: assertionResponse,
+      expectedChallenge: tokenPayload.challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      credential: {
+        id: device.credentialID,
+        publicKey: new Uint8Array(Buffer.from(device.publicKeyBase64Url, 'base64url')),
+        counter: device.counter || 0,
+        transports: device.transports
+      },
+      requireUserVerification: true
+    });
+    if (!verification.verified) {
+      return res.status(401).json({ error: 'Biometric / Passkey verification failed.' });
+    }
+    devices[idx].counter = verification.authenticationInfo.newCounter;
+    devices[idx].lastUsedAt = new Date().toISOString();
+    writeJsonDB(DEVICES_FILE, devices);
+
+    const deviceToken = signToken({
+      type: 'device-session',
+      credentialID: device.credentialID,
+      deviceName: device.deviceName,
+      exp: Date.now() + 30 * 24 * 60 * 60 * 1000
+    });
+
+    serverLogger.write('INFO', 'DEVICE_PASSKEY_LOGIN', {
+      deviceId: device.deviceId,
+      deviceName: device.deviceName,
+      ip: getClientIp(req)
+    });
+    res.json({ verified: true, deviceName: device.deviceName, deviceToken });
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'Passkey login verification failed.' });
+  }
+});
+
+// 5. List Registered Devices
+app.get('/api/manage/devices', requireAllowedIp, requireManageCode, (req, res) => {
+  const devices = readJsonDB(DEVICES_FILE).filter((d) => !d.revoked);
+  res.json({ devices });
+});
+
+// 6. Revoke a Registered Device
+app.delete('/api/manage/devices/:deviceId', requireAllowedIp, requireManageCode, (req, res) => {
+  const { deviceId } = req.params;
+  const devices = readJsonDB(DEVICES_FILE);
+  const idx = devices.findIndex((d) => d.deviceId === deviceId);
+  if (idx === -1) {
+    return res.status(404).json({ error: 'Device not found.' });
+  }
+  devices[idx].revoked = true;
+  devices[idx].revokedAt = new Date().toISOString();
+  writeJsonDB(DEVICES_FILE, devices);
+  serverLogger.write('WARN', 'DEVICE_REVOKED', { deviceId, deviceName: devices[idx].deviceName });
+  res.json({ success: true, devices: devices.filter((d) => !d.revoked) });
 });
 
 function enrichOrdersWithEstimate(orders) {
