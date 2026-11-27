@@ -48,8 +48,9 @@ function loadEnvConfig() {
 
 function getAllowedIps() {
   const cfg = loadEnvConfig();
-  return cfg.ALLOWED_MANAGE_IPS.split(',')
-    .map((ip) => ip.trim().replace(/^::ffff:/i, ''))
+  return String(cfg.ALLOWED_MANAGE_IPS || '')
+    .split(/[,\r\n]+/)
+    .map((ip) => ip.trim().replace(/^["']|["']$/g, '').replace(/^::ffff:/i, ''))
     .filter(Boolean);
 }
 
